@@ -1,0 +1,9 @@
+# 独立 git 子仓库（工作副本，不属于本仓库内容）
+upstream/
+
+# 一次性分析脚本
+tmp/
+
+node_modules/
+*.log
+.env
