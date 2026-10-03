@@ -15,8 +15,12 @@
 //   node check-plugin-deploy.mjs --profile <dir> --source <dir>
 //
 // 退出码：0 = 全部一致；1 = 有插件落后；2 = 读不到 profile。
-import { readFileSync, existsSync, statSync, lstatSync, realpathSync, readdirSync } from 'node:fs'
+import {
+  readFileSync, existsSync, statSync, lstatSync, realpathSync, readdirSync,
+  mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync,
+} from 'node:fs'
 import { join, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 
 const DEFAULTS = {
@@ -175,33 +179,130 @@ export function checkDeploy({ profileDir = DEFAULTS.profileDir, sourceRoot = DEF
   return { ok: true, profileDir, sourceRoot, entries, problems }
 }
 
+// ── 自测（--selftest）───────────────────────────────────────────────────────
+// 这条防线自己也得是可靠的：它一旦误判，就会把人引向错误的处置
+// （把 registry 包当成复制目录，或反过来）。所以用一个临时 fixture 环境
+// 把四种判定逐一钉住，不依赖任何真实 profile。
+export function runSelfTest() {
+  let failures = 0
+  const check = (name, cond, detail) => {
+    if (cond) console.log('  PASS ' + name)
+    else { failures++; console.log('  FAIL ' + name + (detail ? ' — ' + detail : '')) }
+  }
+
+  // classifySpec
+  check('classifySpec: link: 前缀判为 link', classifySpec('link:D:/x').kind === 'link')
+  check('classifySpec: 版本号判为 version', classifySpec('^0.2.2').kind === 'version')
+  check('classifySpec: 未声明判为 unknown', classifySpec(undefined).kind === 'unknown' && classifySpec('').kind === 'unknown')
+
+  const dir = mkdtempSync(join(tmpdir(), 'deploy-selftest-'))
+  try {
+    const profileDir = join(dir, 'profile')
+    const sourceRoot = join(dir, 'src')
+    mkdirSync(join(profileDir, 'node_modules'), { recursive: true })
+
+    /** 造一个插件：本地源码 + profile 实装副本。 */
+    const make = (name, { localVersion, installedVersion, inLock, clientMtimeDeltaMs = 0, linkSpec }) => {
+      const srcDir = join(sourceRoot, name)
+      mkdirSync(join(srcDir, 'lib'), { recursive: true })
+      writeFileSync(join(srcDir, 'package.json'), JSON.stringify({ name, version: localVersion }))
+      const srcClient = join(srcDir, 'lib', 'client.js')
+      writeFileSync(srcClient, '// local build')
+
+      const instDir = join(profileDir, 'node_modules', name)
+      mkdirSync(join(instDir, 'lib'), { recursive: true })
+      writeFileSync(join(instDir, 'package.json'), JSON.stringify({ name, version: installedVersion }))
+      const instClient = join(instDir, 'lib', 'client.js')
+      writeFileSync(instClient, '// installed build')
+
+      // 用 mtime 表达"副本更旧"：本地构建时间 = 实装 + delta
+      const base = Date.now() / 1000
+      if (clientMtimeDeltaMs !== 0) {
+        utimesSync(instClient, base - 3600, base - 3600)
+        utimesSync(srcClient, base + clientMtimeDeltaMs / 1000, base + clientMtimeDeltaMs / 1000)
+      }
+      if (inLock) writeFileSync(join(profileDir, 'pnpm-lock.yaml'), `  ${name}@${installedVersion}:\n    resolution: {}\n`)
+      return { name, spec: linkSpec ?? `^${localVersion}` }
+    }
+
+    // 1) link 安装
+    const linked = make('dsh-linked', { localVersion: '1.0.0', installedVersion: '1.0.0', inLock: false, linkSpec: 'link:D:/src/dsh-linked' })
+    const r1 = compareEntry(linked.name, linked.spec, { profileDir, sourceRoot })
+    check('link 安装判为 linked（改动即生效）', r1.verdict === 'linked', r1.verdict)
+
+    // 2) registry 包 + 版本落后
+    const reg = make('dsh-registry', { localVersion: '0.2.2', installedVersion: '0.2.1', inLock: true })
+    const r2 = compareEntry(reg.name, reg.spec, { profileDir, sourceRoot })
+    check('registry 包版本落后判为 stale-registry', r2.verdict === 'stale-registry', r2.verdict)
+    check('registry 落后的处置是「发布 + 抬依赖」', /发布新版本/.test(r2.action), r2.action)
+
+    // 3) 复制目录 + 版本相同但副本更旧（stock-picks 的真实情形）
+    const copied = make('dsh-copied', { localVersion: '0.1.0', installedVersion: '0.1.0', inLock: false, clientMtimeDeltaMs: 3600_000 })
+    const r3 = compareEntry(copied.name, copied.spec, { profileDir, sourceRoot })
+    check('版本相同但副本更旧 → 仍判为落后（版本号不可靠）', r3.verdict === 'stale-copy', r3.verdict)
+    check('复制目录落后的处置是「重新复制 / 改建 Junction」', /重新复制|Junction/.test(r3.action), r3.action)
+
+    // 4) 完全一致
+    const same = make('dsh-same', { localVersion: '1.2.3', installedVersion: '1.2.3', inLock: true })
+    const r4 = compareEntry(same.name, same.spec, { profileDir, sourceRoot })
+    check('版本一致且副本不旧 → ok', r4.verdict === 'ok', r4.verdict)
+
+    // 5) 本地没有源码 → 不评价
+    const r5 = compareEntry('dsh-not-ours', '^1.0.0', { profileDir, sourceRoot })
+    check('本地无源码目录 → not-source（不误报）', r5.verdict === 'not-source', r5.verdict)
+
+    // 6) checkDeploy 能发现"未写进 dependencies 却存在于 node_modules"的插件
+    writeFileSync(join(profileDir, 'package.json'), JSON.stringify({
+      name: 'fake-profile',
+      dependencies: { 'dsh-registry': '^0.2.2' },
+    }))
+    const all = checkDeploy({ profileDir, sourceRoot })
+    const names = all.entries.map((e) => e.name)
+    check('扫到了 dependencies 里的插件', names.includes('dsh-registry'), names.join(','))
+    check('也扫到了只在 node_modules 里的插件（stock-picks 曾因此漏报）', names.includes('dsh-copied'), names.join(','))
+    check('problems 同时包含两类落后', all.problems.length >= 2, String(all.problems.length))
+    check('link 安装不计入 problems', !all.problems.some((p) => p.name === 'dsh-linked'))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+
+  console.log('')
+  if (failures === 0) console.log('✓ 自测通过')
+  else console.log(`✗ 自测失败 ${failures} 项`)
+  return failures
+}
+
 // ── 脚本入口 ────────────────────────────────────────────────────────────────
 const invokedDirectly = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href
 if (invokedDirectly) {
   const argv = process.argv.slice(2)
-  const opt = (flag, fallback) => {
-    const i = argv.indexOf(flag)
-    return i >= 0 && argv[i + 1] ? argv[i + 1] : fallback
-  }
-  const r = checkDeploy({
-    profileDir: opt('--profile', DEFAULTS.profileDir),
-    sourceRoot: opt('--source', DEFAULTS.sourceRoot),
-  })
-  if (!r.ok) {
-    console.error('✗ ' + r.error)
-    process.exit(2)
-  }
-  console.log(`插件部署一致性（profile: ${r.profileDir}）\n`)
-  const width = Math.max(...r.entries.map((e) => e.name.length), 12)
-  for (const e of r.entries) {
-    console.log(`${ICON[e.verdict] ?? '?'} ${e.name.padEnd(width)}  ${e.detail}`)
-    if (e.verdict === 'stale-registry' || e.verdict === 'stale-copy') console.log(`   └─ 要做：${e.action}`)
-  }
-  console.log('')
-  if (r.problems.length === 0) {
-    console.log('✓ 所有插件的实装副本都与本地源码一致')
+  if (argv.includes('--selftest')) {
+    process.exitCode = runSelfTest() > 0 ? 1 : 0
   } else {
-    console.log(`✗ ${r.problems.length} 个插件的本地改动尚未生效：${r.problems.map((p) => p.name).join('、')}`)
-    process.exitCode = 1
+    const opt = (flag, fallback) => {
+      const i = argv.indexOf(flag)
+      return i >= 0 && argv[i + 1] ? argv[i + 1] : fallback
+    }
+    const r = checkDeploy({
+      profileDir: opt('--profile', DEFAULTS.profileDir),
+      sourceRoot: opt('--source', DEFAULTS.sourceRoot),
+    })
+    if (!r.ok) {
+      console.error('✗ ' + r.error)
+      process.exit(2)
+    }
+    console.log(`插件部署一致性（profile: ${r.profileDir}）\n`)
+    const width = Math.max(...r.entries.map((e) => e.name.length), 12)
+    for (const e of r.entries) {
+      console.log(`${ICON[e.verdict] ?? '?'} ${e.name.padEnd(width)}  ${e.detail}`)
+      if (e.verdict === 'stale-registry' || e.verdict === 'stale-copy') console.log(`   └─ 要做：${e.action}`)
+    }
+    console.log('')
+    if (r.problems.length === 0) {
+      console.log('✓ 所有插件的实装副本都与本地源码一致')
+    } else {
+      console.log(`✗ ${r.problems.length} 个插件的本地改动尚未生效：${r.problems.map((p) => p.name).join('、')}`)
+      process.exitCode = 1
+    }
   }
 }
